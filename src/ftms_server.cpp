@@ -11,6 +11,7 @@ constexpr int16_t kMinimumInclineTenthsPercent = 0;
 constexpr int16_t kMaximumInclineTenthsPercent = 150;
 constexpr uint16_t kInclineStepTenthsPercent = 1;
 constexpr char kDeviceName[] = "Precor 9.23 Turbo";
+constexpr float kPi = 3.14159265f;
 
 const NimBLEUUID kFtmsServiceUuid((uint16_t)0x1826);
 const NimBLEUUID kWahooRunServiceUuid(
@@ -148,52 +149,61 @@ FtmsServerCallbacks gFtmsServerCallbacks;
 
 }  // namespace
 
-void ftmsBegin() {
+void ftmsBegin(bool enableControlServices) {
   NimBLEDevice::init(kDeviceName);
 
   NimBLEServer* server = NimBLEDevice::createServer();
-  server->setCallbacks(&gFtmsServerCallbacks);
+  if (enableControlServices) {
+    server->setCallbacks(&gFtmsServerCallbacks);
+  }
   server->advertiseOnDisconnect(true);
 
   NimBLEService* ftmsService = server->createService(kFtmsServiceUuid);
-  NimBLEService* wahooService =
-      server->createService(kWahooRunServiceUuid);
-
-  NimBLECharacteristic* wahooNotify = wahooService->createCharacteristic(
-      kWahooRunNotifyUuid,
-      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE_NR |
-          NIMBLE_PROPERTY::NOTIFY);
-  NimBLECharacteristic* wahooWrite = wahooService->createCharacteristic(
-      kWahooRunWriteUuid,
-      NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::INDICATE);
-  wahooNotify->setCallbacks(&gWahooRunCallbacks);
-  wahooWrite->setCallbacks(&gWahooRunCallbacks);
+  if (enableControlServices) {
+    NimBLEService* wahooService =
+        server->createService(kWahooRunServiceUuid);
+    NimBLECharacteristic* wahooNotify = wahooService->createCharacteristic(
+        kWahooRunNotifyUuid,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE_NR |
+            NIMBLE_PROPERTY::NOTIFY);
+    NimBLECharacteristic* wahooWrite = wahooService->createCharacteristic(
+        kWahooRunWriteUuid,
+        NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::INDICATE);
+    wahooNotify->setCallbacks(&gWahooRunCallbacks);
+    wahooWrite->setCallbacks(&gWahooRunCallbacks);
+  }
 
   gTreadmillData = ftmsService->createCharacteristic(
       kTreadmillDataUuid, NIMBLE_PROPERTY::NOTIFY);
   NimBLECharacteristic* machineFeature = ftmsService->createCharacteristic(
       kFitnessMachineFeatureUuid, NIMBLE_PROPERTY::READ);
-  NimBLECharacteristic* supportedInclinationRange =
-      ftmsService->createCharacteristic(kSupportedInclinationRangeUuid,
-                                        NIMBLE_PROPERTY::READ);
-  gControlPoint = ftmsService->createCharacteristic(
-      kFtmsControlPointUuid,
-      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
-  gControlPoint->setCallbacks(&gFtmsControlPointCallbacks);
 
   const uint8_t features[] = {0x08, 0x00, 0x00, 0x00,
-                              0x02, 0x20, 0x00, 0x00};
+                              static_cast<uint8_t>(enableControlServices ? 0x02
+                                                                        : 0x00),
+                              static_cast<uint8_t>(enableControlServices ? 0x20
+                                                                        : 0x00),
+                              0x00, 0x00};
   machineFeature->setValue(features, sizeof(features));
+  if (enableControlServices) {
+    NimBLECharacteristic* supportedInclinationRange =
+        ftmsService->createCharacteristic(kSupportedInclinationRangeUuid,
+                                          NIMBLE_PROPERTY::READ);
+    gControlPoint = ftmsService->createCharacteristic(
+        kFtmsControlPointUuid,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::INDICATE);
+    gControlPoint->setCallbacks(&gFtmsControlPointCallbacks);
 
-  const uint8_t inclinationRange[] = {
-      static_cast<uint8_t>(kMinimumInclineTenthsPercent & 0xFF),
-      static_cast<uint8_t>(kMinimumInclineTenthsPercent >> 8),
-      static_cast<uint8_t>(kMaximumInclineTenthsPercent & 0xFF),
-      static_cast<uint8_t>(kMaximumInclineTenthsPercent >> 8),
-      static_cast<uint8_t>(kInclineStepTenthsPercent & 0xFF),
-      static_cast<uint8_t>(kInclineStepTenthsPercent >> 8)};
-  supportedInclinationRange->setValue(inclinationRange,
-                                      sizeof(inclinationRange));
+    const uint8_t inclinationRange[] = {
+        static_cast<uint8_t>(kMinimumInclineTenthsPercent & 0xFF),
+        static_cast<uint8_t>(kMinimumInclineTenthsPercent >> 8),
+        static_cast<uint8_t>(kMaximumInclineTenthsPercent & 0xFF),
+        static_cast<uint8_t>(kMaximumInclineTenthsPercent >> 8),
+        static_cast<uint8_t>(kInclineStepTenthsPercent & 0xFF),
+        static_cast<uint8_t>(kInclineStepTenthsPercent >> 8)};
+    supportedInclinationRange->setValue(inclinationRange,
+                                        sizeof(inclinationRange));
+  }
   server->start();
 
   NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
@@ -202,30 +212,59 @@ void ftmsBegin() {
     Serial.println("Warning: could not add BLE device name to scan response.");
   }
   advertising->addServiceUUID(kFtmsServiceUuid);
-  advertising->addServiceUUID(kWahooRunServiceUuid);
+  if (enableControlServices) {
+    advertising->addServiceUUID(kWahooRunServiceUuid);
+  }
   if (!advertising->start()) {
     Serial.println("Error: BLE advertising failed to start.");
   }
 }
 
-void ftmsUpdateTreadmillData(float speedKph) {
+void ftmsUpdateTreadmillData(float speedKph,
+                             bool speedValid,
+                             float inclinePercent,
+                             bool inclineValid) {
   if (gTreadmillData == nullptr) {
     return;
   }
 
-  const uint16_t speedHundredthsKph =
-      static_cast<uint16_t>(speedKph * 100.0f);
-  const uint16_t inclineTenthsPercent =
-      static_cast<uint16_t>(gInclineTenthsPercent.load());
-  const uint8_t treadmillData[] = {
-      0x08, 0x00,
-      static_cast<uint8_t>(speedHundredthsKph & 0xFF),
-      static_cast<uint8_t>(speedHundredthsKph >> 8),
-      static_cast<uint8_t>(inclineTenthsPercent & 0xFF),
-      static_cast<uint8_t>(inclineTenthsPercent >> 8),
-      0x00, 0x00};
+  uint16_t flags = speedValid ? 0x0000 : 0x0001;
+  uint8_t treadmillData[8] = {};
+  size_t dataLength = 2;
+  treadmillData[0] = static_cast<uint8_t>(flags & 0xFF);
+  treadmillData[1] = static_cast<uint8_t>(flags >> 8);
 
-  gTreadmillData->setValue(treadmillData, sizeof(treadmillData));
+  if (speedValid) {
+    const float boundedSpeed = constrain(speedKph, 0.0f, 655.35f);
+    const uint16_t speedHundredthsKph =
+        static_cast<uint16_t>(lroundf(boundedSpeed * 100.0f));
+    treadmillData[dataLength++] =
+        static_cast<uint8_t>(speedHundredthsKph & 0xFF);
+    treadmillData[dataLength++] =
+        static_cast<uint8_t>(speedHundredthsKph >> 8);
+  }
+
+  if (inclineValid) {
+    flags |= 0x0008;
+    const float boundedIncline = constrain(inclinePercent, 0.0f, 15.0f);
+    const int16_t inclineTenthsPercent =
+        static_cast<int16_t>(lroundf(boundedIncline * 10.0f));
+    const int16_t rampAngleTenthsDegree = static_cast<int16_t>(
+        lroundf(atanf(boundedIncline / 100.0f) * 1800.0f / kPi));
+    treadmillData[dataLength++] =
+        static_cast<uint8_t>(inclineTenthsPercent & 0xFF);
+    treadmillData[dataLength++] =
+        static_cast<uint8_t>(inclineTenthsPercent >> 8);
+    treadmillData[dataLength++] =
+        static_cast<uint8_t>(rampAngleTenthsDegree & 0xFF);
+    treadmillData[dataLength++] =
+        static_cast<uint8_t>(rampAngleTenthsDegree >> 8);
+  }
+
+  treadmillData[0] = static_cast<uint8_t>(flags & 0xFF);
+  treadmillData[1] = static_cast<uint8_t>(flags >> 8);
+
+  gTreadmillData->setValue(treadmillData, dataLength);
   gTreadmillData->notify();
 }
 
